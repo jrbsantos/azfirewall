@@ -63,6 +63,10 @@ CLI está instalada/atualizada (`az extension add --name azure-firewall
 
 ## Uso rápido
 
+> Há um CSV de exemplo pronto para cada tipo em [`examples/`](examples/)
+> (`examples/network.csv`, `examples/nat.csv`, `examples/application.csv`) —
+> copie um deles como ponto de partida.
+
 ```bash
 chmod +x criar_regras_firewall.sh
 
