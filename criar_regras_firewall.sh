@@ -3,11 +3,13 @@
 # criar_regras_firewall.sh
 #
 # Lê um arquivo CSV e cria regras no Azure Firewall usando o Azure CLI.
-# Suporta os três tipos de regra do Azure Firewall "clássico":
+# Suporta os três tipos de regra do Azure Firewall "clássico", selecionado
+# pela opção -t (cada tipo tem seu PRÓPRIO formato de CSV, com só as
+# colunas que fazem sentido para ele — veja "FORMATO DO CSV" abaixo):
 #
-#   rule_type=network      -> az network firewall network-rule create
-#   rule_type=nat          -> az network firewall nat-rule create      (DNAT)
-#   rule_type=application  -> az network firewall application-rule create
+#   -t network      -> az network firewall network-rule create
+#   -t nat          -> az network firewall nat-rule create      (DNAT)
+#   -t application  -> az network firewall application-rule create
 #
 # Referências oficiais consultadas (Microsoft Learn):
 #   - Tutorial: https://learn.microsoft.com/azure/firewall/deploy-cli
@@ -16,20 +18,33 @@
 #   - Application rule: https://learn.microsoft.com/cli/azure/network/firewall/application-rule
 #
 # ---------------------------------------------------------------------------
+# POR QUE UM CSV DIFERENTE POR TIPO DE REGRA?
+#
+#   As três regras têm campos bem diferentes entre si (ex.: só NAT tem
+#   translated_address/translated_port; só Application tem target_fqdns).
+#   Um CSV único com todas as colunas de todos os tipos obrigaria a deixar
+#   várias células em branco em toda linha, o que é fácil de errar ao
+#   preencher manualmente (contar vírgulas, lembrar quais colunas ignorar
+#   para cada tipo). Por isso cada rule_type tem seu próprio formato de CSV,
+#   enxuto, só com os campos que ele realmente usa — e uma única execução
+#   do script sempre lida com um tipo por vez (indicado em -t).
+#
+# ---------------------------------------------------------------------------
 # IDEMPOTÊNCIA (importante):
 #
-#   Antes de criar qualquer regra, o script consulta as rule collections já
-#   existentes no firewall (uma única chamada "az network firewall show",
-#   cobrindo os três tipos) e monta um índice em memória de
-#   "tipo|coleção|regra" já cadastradas.
+#   Antes de criar qualquer regra, o script consulta as rule collections do
+#   tipo selecionado (-t) que já existem no firewall (uma única chamada
+#   "az network firewall show") e monta um índice em memória de
+#   "coleção|regra" já cadastradas.
 #
-#   Para cada linha do CSV, se a combinação rule_type + collection_name +
-#   rule_name já existir no firewall, a linha é PULADA (não duplica e não
-#   sobrescreve). Regras que já existem não são atualizadas mesmo que os
-#   demais campos do CSV sejam diferentes dos valores atuais no Azure — se
-#   for necessário alterar uma regra existente, isso deve ser feito de forma
-#   explícita (fora deste script), por exemplo com o comando "*-rule update"
-#   correspondente, ou removendo a regra antes de rodar o script novamente.
+#   Para cada linha do CSV, se a combinação collection_name + rule_name já
+#   existir no firewall (nesse tipo de regra), a linha é PULADA (não
+#   duplica e não sobrescreve). Regras que já existem não são atualizadas
+#   mesmo que os demais campos do CSV sejam diferentes dos valores atuais
+#   no Azure — se for necessário alterar uma regra existente, isso deve ser
+#   feito de forma explícita (fora deste script), por exemplo com o comando
+#   "*-rule update" correspondente, ou removendo a regra antes de rodar o
+#   script novamente.
 #
 #   Isso permite executar o script quantas vezes forem necessárias com o
 #   mesmo CSV (ou um CSV incremental) sem risco de duplicar regras.
@@ -37,75 +52,80 @@
 # NOTA SOBRE "priority" E "action":
 #
 #   Na Azure Firewall "clássica", priority e action pertencem à *coleção*
-#   de regras, não à regra individual (nos três tipos). Isso quer dizer que
-#   esses valores só têm efeito na primeira regra que cria a coleção —
-#   linhas seguintes do CSV que apontem para a mesma coleção com
-#   priority/action diferentes são silenciosamente ignoradas pela API. O
-#   script valida isso e emite um aviso caso detecte valores divergentes
-#   para a mesma coleção (coleções de tipos diferentes com o mesmo nome são
-#   tratadas separadamente, pois ocupam "namespaces" distintos no Azure).
+#   de regras, não à regra individual. Isso quer dizer que esses valores só
+#   têm efeito na primeira regra que cria a coleção — linhas seguintes do
+#   CSV que apontem para a mesma coleção com priority/action diferentes são
+#   silenciosamente ignoradas pela API. O script valida isso e emite um
+#   aviso caso detecte valores divergentes para a mesma coleção.
 #
 # ---------------------------------------------------------------------------
-# FORMATO DO CSV (com cabeçalho obrigatório na primeira linha):
+# FORMATO DO CSV (com cabeçalho obrigatório e exato na primeira linha —
+# o script recusa a execução se o cabeçalho não bater com o esperado para
+# o -t escolhido, e também recusa qualquer linha de dados com número de
+# campos diferente do esperado, para não desalinhar colunas por causa de
+# uma vírgula a mais ou a menos):
 #
-#   collection_name,rule_name,priority,action,protocols,source_addresses,destination_addresses,destination_ports,rule_type,translated_address,translated_port,target_fqdns,fqdn_tags
+# -t network (regra de rede — Allow/Deny por IP/porta/protocolo):
+#   collection_name,rule_name,priority,action,protocols,source_addresses,destination_addresses,destination_ports
 #
-# As 8 primeiras colunas são as mesmas de versões anteriores deste script
-# (CSVs antigos continuam funcionando sem alteração: rule_type vazio é
-# tratado como "network"). As 5 últimas colunas são novas e só são usadas
-# conforme o rule_type de cada linha; deixe-as em branco quando não se
-# aplicarem.
+#   - collection_name       : nome da coleção (criada automaticamente se não existir)
+#   - rule_name              : nome da regra
+#   - priority               : número de 100 a 65000 (só a 1ª regra da coleção; opcional nas demais)
+#   - action                 : Allow ou Deny (padrão: Allow)
+#   - protocols              : Any, ICMP, TCP ou UDP, separados por ";"
+#   - source_addresses       : IP(s)/CIDR de origem, separados por ";". "*" = qualquer origem
+#   - destination_addresses  : IP(s)/CIDR de destino, separados por ";"
+#   - destination_ports      : porta(s) de destino, separadas por ";". "*" = qualquer porta
 #
-# Campos comuns a todos os tipos:
-#   - collection_name : nome da coleção de regras (criada automaticamente
-#                        se ainda não existir)
-#   - rule_name        : nome da regra
-#   - priority         : número de 100 a 65000 (só tem efeito na 1ª regra
-#                        que cria a coleção; opcional nas demais)
-#   - rule_type        : network (padrão), nat ou application
+#   Exemplo:
+#   Net-Coll01,Allow-DNS,200,Allow,UDP,10.0.2.0/24,168.63.129.16;8.8.8.8,53
 #
-# rule_type=network (regra de rede — Allow/Deny por IP/porta/protocolo):
-#   - action                : Allow ou Deny (padrão: Allow)
-#   - protocols             : Any, ICMP, TCP ou UDP, separados por ";"
-#   - source_addresses      : IP(s)/CIDR de origem, separados por ";". "*" = qualquer origem
-#   - destination_addresses : IP(s)/CIDR de destino, separados por ";"
-#   - destination_ports     : porta(s) de destino, separadas por ";". "*" = qualquer porta
-#   (translated_address, translated_port, target_fqdns, fqdn_tags: ignorados)
+# -t nat (DNAT — redireciona tráfego que chega no firewall para um
+# endereço/porta internos; a action é sempre "Dnat", por isso não há
+# coluna de action neste formato):
+#   collection_name,rule_name,priority,protocols,source_addresses,destination_addresses,destination_ports,translated_address,translated_port
 #
-# rule_type=nat (DNAT — redireciona tráfego que chega no firewall para um
-# endereço/porta internos):
-#   - action                : sempre Dnat (pode deixar em branco)
-#   - protocols             : TCP ou UDP, separados por ";" (não suporta Any/ICMP)
-#   - source_addresses      : IP(s)/CIDR de origem, separados por ";"
-#   - destination_addresses : endereço público/IP do firewall que recebe o tráfego
-#   - destination_ports     : porta em que o tráfego chega
-#   - translated_address    : endereço interno para onde o tráfego é traduzido
-#   - translated_port       : porta interna para onde o tráfego é traduzido
-#   (target_fqdns, fqdn_tags: ignorados)
+#   - collection_name       : nome da coleção
+#   - rule_name              : nome da regra
+#   - priority               : número de 100 a 65000 (só a 1ª regra da coleção)
+#   - protocols              : TCP ou UDP, separados por ";" (não suporta Any/ICMP)
+#   - source_addresses       : IP(s)/CIDR de origem, separados por ";"
+#   - destination_addresses  : endereço público/IP do firewall que recebe o tráfego
+#   - destination_ports      : porta em que o tráfego chega
+#   - translated_address     : endereço interno para onde o tráfego é traduzido
+#   - translated_port        : porta interna para onde o tráfego é traduzido
 #
-# rule_type=application (regra de aplicação — Allow/Deny por FQDN):
-#   - action           : Allow ou Deny (padrão: Allow)
-#   - protocols        : pares "Protocolo=Porta" separados por ";", ex.: "Http=80;Https=443"
+#   Exemplo:
+#   Nat-Coll01,DNAT-RDP,210,TCP,0.0.0.0/0,20.1.2.3,3389,10.0.2.10,3389
+#
+# -t application (regra de aplicação — Allow/Deny por FQDN; não tem IP de
+# destino, por isso não há colunas destination_addresses/destination_ports
+# neste formato):
+#   collection_name,rule_name,priority,action,protocols,source_addresses,target_fqdns,fqdn_tags
+#
+#   - collection_name : nome da coleção
+#   - rule_name         : nome da regra
+#   - priority          : número de 100 a 65000 (só a 1ª regra da coleção)
+#   - action            : Allow ou Deny (padrão: Allow)
+#   - protocols         : pares "Protocolo=Porta" separados por ";", ex.: "Http=80;Https=443"
 #                        (protocolos aceitos: Http, Https, Mssql)
-#   - source_addresses : IP(s)/CIDR de origem, separados por ";"
+#   - source_addresses  : IP(s)/CIDR de origem, separados por ";"
 #   - target_fqdns      : FQDN(s) de destino, separados por ";" (ex.: "www.contoso.com;*.contoso.net")
 #   - fqdn_tags         : FQDN tag(s) do Azure, separadas por ";" (ex.: "WindowsUpdate")
 #                        (pelo menos um entre target_fqdns e fqdn_tags é obrigatório)
-#   (destination_addresses, destination_ports: ignorados — application rule não usa IP de destino)
 #
-# Exemplos de linha (uma de cada tipo):
-#   Net-Coll01,Allow-DNS,200,Allow,UDP,10.0.2.0/24,168.63.129.16;8.8.8.8,53,network,,,,
-#   Nat-Coll01,DNAT-RDP,210,,TCP,0.0.0.0/0,20.1.2.3,3389,nat,10.0.2.10,3389,,
-#   App-Coll01,Allow-Web,220,Allow,Http=80;Https=443,10.0.2.0/24,,,application,,,www.microsoft.com;*.ubuntu.com,
+#   Exemplo:
+#   App-Coll01,Allow-Web,220,Allow,Http=80;Https=443,10.0.2.0/24,www.microsoft.com;*.ubuntu.com,
 #
 # ---------------------------------------------------------------------------
 # USO:
 #
-#   ./criar_regras_firewall.sh -g <resource-group> -f <firewall-name> -c <arquivo.csv> [-n] [-l <log-file>]
+#   ./criar_regras_firewall.sh -g <resource-group> -f <firewall-name> -t <network|nat|application> -c <arquivo.csv> [-n] [-l <log-file>]
 #
 #   -g   Resource group onde está o Azure Firewall
 #   -f   Nome do Azure Firewall
-#   -c   Caminho do arquivo CSV com as regras
+#   -t   Tipo de regra do CSV: network, nat ou application
+#   -c   Caminho do arquivo CSV com as regras (no formato do -t escolhido)
 #   -n   Modo dry-run: apenas exibe os comandos que seriam executados
 #   -l   Caminho de um arquivo de log (a saída também é gravada nele)
 #   -h   Exibe esta ajuda
@@ -146,6 +166,7 @@ FIREWALL_NAME=""
 CSV_FILE=""
 DRY_RUN=false
 LOG_FILE=""
+RULE_TYPE_RAW=""
 
 # Padrão usado para reconhecer, no texto de erro do Azure CLI, que o
 # problema é sessão/token expirado ou inválido (e não outra falha
@@ -154,22 +175,24 @@ LOG_FILE=""
 AUTH_ERROR_REGEX="az login|AADSTS|refresh token|token has expired|Please run|has not been authenticated|InvalidAuthenticationToken|Please re-authenticate"
 
 usage() {
-  echo "Uso: $0 -g <resource-group> -f <firewall-name> -c <arquivo.csv> [-n] [-l <log-file>]"
+  echo "Uso: $0 -g <resource-group> -f <firewall-name> -t <network|nat|application> -c <arquivo.csv> [-n] [-l <log-file>]"
   echo
   echo "  -g   Resource group do Azure Firewall"
   echo "  -f   Nome do Azure Firewall"
-  echo "  -c   Arquivo CSV com as regras"
+  echo "  -t   Tipo de regra do CSV: network, nat ou application"
+  echo "  -c   Arquivo CSV com as regras (no formato do -t escolhido)"
   echo "  -n   Dry-run (apenas exibe os comandos, sem executar)"
   echo "  -l   Também grava a saída neste arquivo de log"
   echo "  -h   Exibe esta ajuda"
   exit 1
 }
 
-while getopts ":g:f:c:nl:h" opt; do
+while getopts ":g:f:c:t:nl:h" opt; do
   case "$opt" in
     g) RESOURCE_GROUP="$OPTARG" ;;
     f) FIREWALL_NAME="$OPTARG" ;;
     c) CSV_FILE="$OPTARG" ;;
+    t) RULE_TYPE_RAW="$OPTARG" ;;
     n) DRY_RUN=true ;;
     l) LOG_FILE="$OPTARG" ;;
     h) usage ;;
@@ -178,7 +201,44 @@ while getopts ":g:f:c:nl:h" opt; do
   esac
 done
 
-[[ -z "$RESOURCE_GROUP" || -z "$FIREWALL_NAME" || -z "$CSV_FILE" ]] && usage
+[[ -z "$RESOURCE_GROUP" || -z "$FIREWALL_NAME" || -z "$CSV_FILE" || -z "$RULE_TYPE_RAW" ]] && usage
+
+RULE_TYPE="${RULE_TYPE_RAW,,}"
+case "$RULE_TYPE" in
+  network|nat|application) ;;
+  *)
+    echo "Erro: -t deve ser 'network', 'nat' ou 'application' (recebido: '$RULE_TYPE_RAW')." >&2
+    usage
+    ;;
+esac
+
+# Formato de CSV esperado para o tipo escolhido: cabeçalho exato, número de
+# campos por linha, e em qual array do recurso do firewall procurar as
+# regras já existentes (idempotência).
+case "$RULE_TYPE" in
+  network)
+    EXPECTED_HEADER="collection_name,rule_name,priority,action,protocols,source_addresses,destination_addresses,destination_ports"
+    EXPECTED_FIELD_COUNT=8
+    JQ_COLLECTION_FIELD="networkRuleCollections"
+    ;;
+  nat)
+    EXPECTED_HEADER="collection_name,rule_name,priority,protocols,source_addresses,destination_addresses,destination_ports,translated_address,translated_port"
+    EXPECTED_FIELD_COUNT=9
+    JQ_COLLECTION_FIELD="natRuleCollections"
+    ;;
+  application)
+    EXPECTED_HEADER="collection_name,rule_name,priority,action,protocols,source_addresses,target_fqdns,fqdn_tags"
+    EXPECTED_FIELD_COUNT=8
+    JQ_COLLECTION_FIELD="applicationRuleCollections"
+    ;;
+esac
+
+trim() {
+  local var="$1"
+  var="${var#"${var%%[![:space:]]*}"}"
+  var="${var%"${var##*[![:space:]]}"}"
+  echo -n "$var"
+}
 
 if [[ -n "$LOG_FILE" ]]; then
   exec > >(tee -a "$LOG_FILE") 2>&1
@@ -187,6 +247,19 @@ fi
 
 if [[ ! -f "$CSV_FILE" ]]; then
   echo "Erro: arquivo '$CSV_FILE' não encontrado."
+  exit 1
+fi
+
+# Valida o cabeçalho do CSV ANTES de qualquer chamada ao Azure — pega de
+# imediato um CSV no formato errado para o -t escolhido (ex.: apontar um
+# CSV de "nat" enquanto roda com -t network).
+CSV_HEADER_NORM=$(trim "$(head -n 1 "$CSV_FILE")")
+CSV_HEADER_NORM="${CSV_HEADER_NORM//, /,}"
+CSV_HEADER_NORM="${CSV_HEADER_NORM// ,/,}"
+if [[ "$CSV_HEADER_NORM" != "$EXPECTED_HEADER" ]]; then
+  echo "Erro: cabeçalho do CSV não confere com o esperado para -t $RULE_TYPE."
+  echo "  Esperado : $EXPECTED_HEADER"
+  echo "  Encontrado: $CSV_HEADER_NORM"
   exit 1
 fi
 
@@ -251,48 +324,36 @@ if [[ "$FIREWALL_EXIT" -ne 0 || -z "$FIREWALL_JSON" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Índice de idempotência: "tipo|collection_name|rule_name" -> 1 para toda
-# regra já existente no firewall, nos três tipos de coleção.
+# Índice de idempotência: "collection_name|rule_name" -> 1 para toda regra
+# do tipo selecionado (-t) já existente no firewall.
 # ---------------------------------------------------------------------------
 declare -A EXISTING_RULES
-while IFS=$'\t' read -r rtype coll rule; do
-  [[ -z "$rtype" || -z "$coll" || -z "$rule" ]] && continue
-  EXISTING_RULES["${rtype}|${coll}|${rule}"]=1
-done < <(echo "$FIREWALL_JSON" | jq -r '
-  ( (.networkRuleCollections // [])[]     | .name as $c | (.rules // [])[] | "network\t\($c)\t\(.name)" ),
-  ( (.natRuleCollections // [])[]         | .name as $c | (.rules // [])[] | "nat\t\($c)\t\(.name)" ),
-  ( (.applicationRuleCollections // [])[] | .name as $c | (.rules // [])[] | "application\t\($c)\t\(.name)" )
+while IFS=$'\t' read -r coll rule; do
+  [[ -z "$coll" || -z "$rule" ]] && continue
+  EXISTING_RULES["${coll}|${rule}"]=1
+done < <(echo "$FIREWALL_JSON" | jq -r --arg field "$JQ_COLLECTION_FIELD" '
+  (.[$field] // [])[] | .name as $c | (.rules // [])[] | "\($c)\t\(.name)"
 ')
-echo "Encontradas ${#EXISTING_RULES[@]} regra(s) já existente(s) no firewall (todos os tipos)."
+echo "Encontradas ${#EXISTING_RULES[@]} regra(s) do tipo '$RULE_TYPE' já existente(s) no firewall."
 
 TOTAL=0
 OK=0
 SKIPPED=0
 FAIL=0
 LINE_NUM=0
-declare -A OK_BY_TYPE
-declare -A SKIPPED_BY_TYPE
-declare -A FAIL_BY_TYPE
-
-trim() {
-  local var="$1"
-  var="${var#"${var%%[![:space:]]*}"}"
-  var="${var%"${var##*[![:space:]]}"}"
-  echo -n "$var"
-}
 
 # Conjuntos válidos (chave em maiúsculas -> valor "canônico" esperado pela API)
 declare -A VALID_PROTOCOLS=( [ANY]="Any" [ICMP]="ICMP" [TCP]="TCP" [UDP]="UDP" )
 declare -A VALID_ACTIONS=( [ALLOW]="Allow" [DENY]="Deny" )
 declare -A VALID_APP_PROTOCOLS=( [HTTP]="Http" [HTTPS]="Https" [MSSQL]="Mssql" )
 
-# Resumo legível dos campos da regra (linha atual), variando por rule_type.
+# Resumo legível dos campos da regra (linha atual), variando por RULE_TYPE.
 # Usa as variáveis do laço principal diretamente (mesma shell, sem subshell).
 format_rule_summary() {
-  local d="tipo=$rule_type"
-  case "$rule_type" in
+  local d="tipo=$RULE_TYPE"
+  case "$RULE_TYPE" in
     nat)
-      d+=" action=${action:-Dnat} protocolo(s)=${protocols//;/, } origem=${source_addresses:-*}"
+      d+=" action=Dnat protocolo(s)=${protocols//;/, } origem=${source_addresses:-*}"
       d+=" destino=${destination_addresses//;/, } porta(s)=${destination_ports//;/, }"
       d+=" traduzido_para=${translated_address}:${translated_port}"
       ;;
@@ -310,41 +371,53 @@ format_rule_summary() {
   echo -n "$d"
 }
 
+# Separa uma linha de CSV em campos, preservando campos vazios no FINAL da
+# linha (ex.: "a,b,," -> 4 campos). "read -a" sozinho descarta um campo
+# vazio final, então acrescentamos um marcador antes do split e removemos
+# em seguida. Resultado fica no array global "raw_fields".
+split_csv_line() {
+  local line="$1"
+  IFS=',' read -ra raw_fields <<< "${line},__END__"
+  unset "raw_fields[${#raw_fields[@]}-1]"
+}
+
 # ---------------------------------------------------------------------------
 # Pré-checagem: avisa se o CSV define priority/action divergentes para a
 # mesma coleção (a Azure só usa o valor da primeira regra que cria a
-# coleção). Chave por tipo+coleção, já que coleções de tipos diferentes com
-# o mesmo nome são recursos independentes no Azure.
+# coleção). collection_name, rule_name e priority estão sempre nas 3
+# primeiras posições, nos três formatos de CSV; "action" só existe nos
+# formatos network/application (na posição 4).
 # ---------------------------------------------------------------------------
-declare -A COLL_ACTION_SEEN
 declare -A COLL_PRIORITY_SEEN
+declare -A COLL_ACTION_SEEN
 _pre_line=0
-while IFS=',' read -r pc_name _pr_name pc_priority pc_action _p1 _p2 _p3 _p4 pc_type _p5 _p6 _p7 _p8; do
+while IFS= read -r pline || [[ -n "$pline" ]]; do
   _pre_line=$((_pre_line + 1))
-  [[ "$_pre_line" -eq 1 && "$pc_name" == "collection_name" ]] && continue
-  [[ -z "$pc_name" || "$pc_name" =~ ^#.*$ ]] && continue
+  [[ "$_pre_line" -eq 1 ]] && continue
+  [[ -z "$pline" || "$pline" =~ ^#.*$ ]] && continue
 
-  pc_name=$(trim "$pc_name")
-  pc_priority=$(trim "$pc_priority")
-  pc_action=$(trim "$pc_action")
-  pc_type=$(trim "$pc_type")
-  [[ -z "$pc_type" ]] && pc_type="network"
-  pc_key="${pc_type}|${pc_name}"
-
-  if [[ -n "$pc_action" ]]; then
-    prev="${COLL_ACTION_SEEN[$pc_key]:-}"
-    if [[ -n "$prev" && "$prev" != "$pc_action" ]]; then
-      echo "Aviso: a coleção '$pc_name' (tipo $pc_type) tem valores de 'action' divergentes no CSV ('$prev' e '$pc_action'). A Azure só usa a action definida na primeira regra que cria a coleção." >&2
-    fi
-    COLL_ACTION_SEEN[$pc_key]="$pc_action"
-  fi
+  split_csv_line "$pline"
+  pc_name=$(trim "${raw_fields[0]:-}")
+  pc_priority=$(trim "${raw_fields[2]:-}")
+  [[ -z "$pc_name" ]] && continue
 
   if [[ -n "$pc_priority" ]]; then
-    prev="${COLL_PRIORITY_SEEN[$pc_key]:-}"
+    prev="${COLL_PRIORITY_SEEN[$pc_name]:-}"
     if [[ -n "$prev" && "$prev" != "$pc_priority" ]]; then
-      echo "Aviso: a coleção '$pc_name' (tipo $pc_type) tem valores de 'priority' divergentes no CSV ('$prev' e '$pc_priority'). A Azure só usa a priority definida na primeira regra que cria a coleção." >&2
+      echo "Aviso: a coleção '$pc_name' tem valores de 'priority' divergentes no CSV ('$prev' e '$pc_priority'). A Azure só usa a priority definida na primeira regra que cria a coleção." >&2
     fi
-    COLL_PRIORITY_SEEN[$pc_key]="$pc_priority"
+    COLL_PRIORITY_SEEN[$pc_name]="$pc_priority"
+  fi
+
+  if [[ "$RULE_TYPE" != "nat" ]]; then
+    pc_action=$(trim "${raw_fields[3]:-}")
+    if [[ -n "$pc_action" ]]; then
+      prev="${COLL_ACTION_SEEN[$pc_name]:-}"
+      if [[ -n "$prev" && "$prev" != "$pc_action" ]]; then
+        echo "Aviso: a coleção '$pc_name' tem valores de 'action' divergentes no CSV ('$prev' e '$pc_action'). A Azure só usa a action definida na primeira regra que cria a coleção." >&2
+      fi
+      COLL_ACTION_SEEN[$pc_name]="$pc_action"
+    fi
   fi
 done < "$CSV_FILE"
 
@@ -380,18 +453,46 @@ run_with_retry() {
   done
 }
 
-while IFS=',' read -r collection_name rule_name priority action protocols source_addresses destination_addresses destination_ports rule_type translated_address translated_port target_fqdns fqdn_tags; do
+while IFS= read -r line || [[ -n "$line" ]]; do
   LINE_NUM=$((LINE_NUM + 1))
 
-  # Pula o cabeçalho
-  if [[ "$LINE_NUM" -eq 1 && "$collection_name" == "collection_name" ]]; then
+  # Pula o cabeçalho (já validado antes do loop)
+  [[ "$LINE_NUM" -eq 1 ]] && continue
+
+  # Pula linhas vazias ou comentadas com #
+  [[ -z "$line" || "$line" =~ ^#.*$ ]] && continue
+
+  TOTAL=$((TOTAL + 1))
+
+  split_csv_line "$line"
+  if [[ "${#raw_fields[@]}" -ne "$EXPECTED_FIELD_COUNT" ]]; then
+    echo "[Linha $LINE_NUM] Ignorada: número de campos incorreto (esperado $EXPECTED_FIELD_COUNT para -t $RULE_TYPE, encontrado ${#raw_fields[@]}) — confira as vírgulas da linha."
+    FAIL=$((FAIL + 1))
     continue
   fi
 
-  # Pula linhas vazias ou comentadas com #
-  [[ -z "$collection_name" || "$collection_name" =~ ^#.*$ ]] && continue
+  # Valores padrão: cada tipo só preenche os campos que usa (os demais
+  # ficam vazios e simplesmente não são referenciados no restante do loop).
+  action=""; destination_addresses=""; destination_ports=""
+  translated_address=""; translated_port=""; target_fqdns=""; fqdn_tags=""
 
-  TOTAL=$((TOTAL + 1))
+  case "$RULE_TYPE" in
+    network)
+      collection_name="${raw_fields[0]}"; rule_name="${raw_fields[1]}"; priority="${raw_fields[2]}"
+      action="${raw_fields[3]}"; protocols="${raw_fields[4]}"; source_addresses="${raw_fields[5]}"
+      destination_addresses="${raw_fields[6]}"; destination_ports="${raw_fields[7]}"
+      ;;
+    nat)
+      collection_name="${raw_fields[0]}"; rule_name="${raw_fields[1]}"; priority="${raw_fields[2]}"
+      protocols="${raw_fields[3]}"; source_addresses="${raw_fields[4]}"; destination_addresses="${raw_fields[5]}"
+      destination_ports="${raw_fields[6]}"; translated_address="${raw_fields[7]}"; translated_port="${raw_fields[8]}"
+      ;;
+    application)
+      collection_name="${raw_fields[0]}"; rule_name="${raw_fields[1]}"; priority="${raw_fields[2]}"
+      action="${raw_fields[3]}"; protocols="${raw_fields[4]}"; source_addresses="${raw_fields[5]}"
+      target_fqdns="${raw_fields[6]}"; fqdn_tags="${raw_fields[7]}"
+      ;;
+  esac
 
   collection_name=$(trim "$collection_name")
   rule_name=$(trim "$rule_name")
@@ -401,7 +502,6 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   source_addresses=$(trim "$source_addresses")
   destination_addresses=$(trim "$destination_addresses")
   destination_ports=$(trim "$destination_ports")
-  rule_type=$(trim "$rule_type")
   translated_address=$(trim "$translated_address")
   translated_port=$(trim "$translated_port")
   target_fqdns=$(trim "$target_fqdns")
@@ -413,31 +513,15 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
     continue
   fi
 
-  # Normaliza/valida rule_type (compatível com CSVs antigos: em branco = network)
-  if [[ -z "$rule_type" ]]; then
-    rule_type="network"
-  else
-    rule_type="${rule_type,,}"
-    case "$rule_type" in
-      network|nat|application) ;;
-      *)
-        echo "[Linha $LINE_NUM] Ignorada: rule_type '$rule_type' inválido (use network, nat ou application)."
-        FAIL=$((FAIL + 1))
-        continue
-        ;;
-    esac
-  fi
-
   # -------------------------------------------------------------------
-  # Idempotência: se a regra já existe nesse tipo+coleção, pula sem
-  # duplicar e sem sobrescrever.
+  # Idempotência: se a regra já existe nessa coleção, pula sem duplicar
+  # e sem sobrescrever.
   # -------------------------------------------------------------------
-  rule_key="${rule_type}|${collection_name}|${rule_name}"
+  rule_key="${collection_name}|${rule_name}"
   if [[ -n "${EXISTING_RULES[$rule_key]:-}" ]]; then
     echo "[Linha $LINE_NUM] Regra '$rule_name' já existe na coleção '$collection_name' -> ignorada (idempotente)."
     echo "    Solicitado no CSV: $(format_rule_summary)"
     SKIPPED=$((SKIPPED + 1))
-    SKIPPED_BY_TYPE[$rule_type]=$(( ${SKIPPED_BY_TYPE[$rule_type]:-0} + 1 ))
     continue
   fi
 
@@ -445,19 +529,18 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   if [[ -n "$priority" ]] && ! [[ "$priority" =~ ^[0-9]+$ && "$priority" -ge 100 && "$priority" -le 65000 ]]; then
     echo "[Linha $LINE_NUM] Ignorada: priority '$priority' inválida (deve ser um número entre 100 e 65000)."
     FAIL=$((FAIL + 1))
-    FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
     continue
   fi
 
   source_list="${source_addresses//;/ }"
   CMD=()
 
-  case "$rule_type" in
+  case "$RULE_TYPE" in
 
     network)
       if [[ -z "$destination_ports" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: rule_type=network exige destination_ports."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: destination_ports é obrigatório."
+        FAIL=$((FAIL + 1))
         continue
       fi
 
@@ -467,7 +550,7 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
         action_key="${action^^}"
         if [[ -z "${VALID_ACTIONS[$action_key]:-}" ]]; then
           echo "[Linha $LINE_NUM] Ignorada: action '$action' inválida (use Allow ou Deny)."
-          FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+          FAIL=$((FAIL + 1))
           continue
         fi
         action="${VALID_ACTIONS[$action_key]}"
@@ -484,8 +567,8 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
         protocols_list+="${VALID_PROTOCOLS[$proto_key]} "
       done
       if [[ -n "$invalid_protocol" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido para rule_type=network (use Any, ICMP, TCP ou UDP)."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido (use Any, ICMP, TCP ou UDP)."
+        FAIL=$((FAIL + 1))
         continue
       fi
 
@@ -508,17 +591,10 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
 
     nat)
       if [[ -z "$destination_addresses" || -z "$destination_ports" || -z "$translated_address" || -z "$translated_port" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: rule_type=nat exige destination_addresses, destination_ports, translated_address e translated_port."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: destination_addresses, destination_ports, translated_address e translated_port são obrigatórios."
+        FAIL=$((FAIL + 1))
         continue
       fi
-
-      if [[ -n "$action" && "${action^^}" != "DNAT" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: action '$action' inválida para rule_type=nat (a única action suportada é Dnat; deixe em branco)."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
-        continue
-      fi
-      action="Dnat"
 
       protocols_list=""
       invalid_protocol=""
@@ -531,8 +607,8 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
         protocols_list+="$proto_key "
       done
       if [[ -n "$invalid_protocol" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido para rule_type=nat (use TCP ou UDP)."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido (use TCP ou UDP)."
+        FAIL=$((FAIL + 1))
         continue
       fi
 
@@ -557,13 +633,9 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
 
     application)
       if [[ -z "$target_fqdns" && -z "$fqdn_tags" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: rule_type=application exige target_fqdns e/ou fqdn_tags."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: pelo menos um entre target_fqdns e fqdn_tags é obrigatório."
+        FAIL=$((FAIL + 1))
         continue
-      fi
-
-      if [[ -n "$destination_addresses" || -n "$destination_ports" ]]; then
-        echo "[Linha $LINE_NUM] Aviso: destination_addresses/destination_ports são ignorados para rule_type=application."
       fi
 
       if [[ -z "$action" ]]; then
@@ -572,7 +644,7 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
         action_key="${action^^}"
         if [[ -z "${VALID_ACTIONS[$action_key]:-}" ]]; then
           echo "[Linha $LINE_NUM] Ignorada: action '$action' inválida (use Allow ou Deny)."
-          FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+          FAIL=$((FAIL + 1))
           continue
         fi
         action="${VALID_ACTIONS[$action_key]}"
@@ -591,8 +663,8 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
         protocols_list+="${VALID_APP_PROTOCOLS[$proto_name_key]}=${proto_port} "
       done
       if [[ -n "$invalid_protocol" ]]; then
-        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido para rule_type=application (use o formato Protocolo=Porta, ex.: Http=80; protocolos aceitos: Http, Https, Mssql)."
-        FAIL=$((FAIL + 1)); FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
+        echo "[Linha $LINE_NUM] Ignorada: protocolo '$invalid_protocol' inválido (use o formato Protocolo=Porta, ex.: Http=80; protocolos aceitos: Http, Https, Mssql)."
+        FAIL=$((FAIL + 1))
         continue
       fi
 
@@ -618,7 +690,6 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
     printf ' %q' "${CMD[@]}"
     echo
     OK=$((OK + 1))
-    OK_BY_TYPE[$rule_type]=$(( ${OK_BY_TYPE[$rule_type]:-0} + 1 ))
     EXISTING_RULES["$rule_key"]=1
     continue
   fi
@@ -626,7 +697,6 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   if run_with_retry "${CMD[@]}" >/dev/null; then
     echo "  -> OK (regra '$rule_name' criada na coleção '$collection_name')"
     OK=$((OK + 1))
-    OK_BY_TYPE[$rule_type]=$(( ${OK_BY_TYPE[$rule_type]:-0} + 1 ))
     EXISTING_RULES["$rule_key"]=1
   else
     retry_rc=$?
@@ -638,18 +708,12 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
     fi
     echo "  -> FALHOU (regra '$rule_name' na coleção '$collection_name')"
     FAIL=$((FAIL + 1))
-    FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
   fi
 
 done < "$CSV_FILE"
 
 echo
-echo "Resumo: $TOTAL regra(s) processada(s), $OK criada(s), $SKIPPED já existente(s) (ignorada(s)), $FAIL com falha."
-for t in network nat application; do
-  t_total=$(( ${OK_BY_TYPE[$t]:-0} + ${SKIPPED_BY_TYPE[$t]:-0} + ${FAIL_BY_TYPE[$t]:-0} ))
-  [[ "$t_total" -eq 0 ]] && continue
-  echo "  - $t: ${OK_BY_TYPE[$t]:-0} criada(s), ${SKIPPED_BY_TYPE[$t]:-0} ignorada(s), ${FAIL_BY_TYPE[$t]:-0} com falha."
-done
+echo "Resumo (rule_type=$RULE_TYPE): $TOTAL regra(s) processada(s), $OK criada(s), $SKIPPED já existente(s) (ignorada(s)), $FAIL com falha."
 
 [[ "$FAIL" -gt 0 ]] && exit 1
 exit 0
