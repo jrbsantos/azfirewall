@@ -112,6 +112,30 @@
 #
 # Pré-requisitos: Azure CLI (az) e jq instalados e "az login" já executado.
 # Ambos já vêm pré-instalados no Azure Cloud Shell.
+#
+# DIAGNÓSTICO DE SESSÃO/PERMISSÃO:
+#
+#   "az account show" sozinho não garante muita coisa: ele só lê o cache
+#   local (~/.azure), então pode "passar" mesmo com o token de atualização
+#   expirado. Por isso o script também roda "az account get-access-token",
+#   que força uma renovação de token de verdade junto ao Azure AD, antes de
+#   fazer qualquer outra coisa. Se a sessão caiu, o script para logo no
+#   início com uma mensagem específica pedindo "az login" novamente, em vez
+#   de deixar o erro aparecer depois, disfarçado de "firewall não
+#   encontrado" ou de uma sequência de "FALHOU" no meio do processamento do
+#   CSV.
+#
+#   Se a sessão expirar NO MEIO da execução (CSV grande, token expira após
+#   ~1h), o script também detecta isso na criação de uma regra e ABORTA
+#   imediatamente com uma mensagem clara — em vez de continuar tentando
+#   criar as regras seguintes e reportando "FALHOU" em cada uma delas sem
+#   dizer por quê. Como o script é idempotente, basta rodar "az login" e
+#   executá-lo de novo: as regras já criadas não serão duplicadas.
+#
+#   Da mesma forma, "resource group não encontrado" e "firewall não
+#   encontrado" agora são erros distintos (antes caíam na mesma mensagem
+#   genérica), e o texto de erro devolvido pelo Azure CLI é sempre exibido
+#   quando o motivo da falha não é reconhecido, em vez de descartado.
 # ---------------------------------------------------------------------------
 
 set -uo pipefail
@@ -122,6 +146,12 @@ FIREWALL_NAME=""
 CSV_FILE=""
 DRY_RUN=false
 LOG_FILE=""
+
+# Padrão usado para reconhecer, no texto de erro do Azure CLI, que o
+# problema é sessão/token expirado ou inválido (e não outra falha
+# qualquer). Reaproveitado no diagnóstico inicial e nas chamadas de
+# criação de regra dentro do loop.
+AUTH_ERROR_REGEX="az login|AADSTS|refresh token|token has expired|Please run|has not been authenticated|InvalidAuthenticationToken|Please re-authenticate"
 
 usage() {
   echo "Uso: $0 -g <resource-group> -f <firewall-name> -c <arquivo.csv> [-n] [-l <log-file>]"
@@ -171,9 +201,22 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-# Verifica se está autenticado no Azure CLI
-if ! az account show >/dev/null 2>&1; then
+# Verifica se está autenticado no Azure CLI. "az account show" só lê o
+# cache local (~/.azure) e pode "passar" mesmo com o token expirado, então
+# em seguida forçamos uma renovação de token de verdade com
+# "az account get-access-token" — é isso que realmente detecta uma sessão
+# caída antes de começarmos a mexer no firewall.
+ACCOUNT_ERR=$(az account show -o none 2>&1)
+if [[ $? -ne 0 ]]; then
   echo "Erro: você não está autenticado no Azure CLI. Execute 'az login' antes de continuar."
+  [[ -n "$ACCOUNT_ERR" ]] && echo "Detalhe retornado pelo Azure CLI: $ACCOUNT_ERR"
+  exit 1
+fi
+
+TOKEN_ERR=$(az account get-access-token -o none 2>&1)
+if [[ $? -ne 0 ]]; then
+  echo "Erro: sua sessão do Azure CLI expirou ou é inválida. Execute 'az login' novamente antes de continuar."
+  [[ -n "$TOKEN_ERR" ]] && echo "Detalhe retornado pelo Azure CLI: $TOKEN_ERR"
   exit 1
 fi
 
@@ -184,13 +227,26 @@ az extension add --name azure-firewall --upgrade --only-show-errors >/dev/null 2
 # a mesma chamada para carregar as coleções/regras existentes (evita
 # chamadas extras "az network firewall show" só para isso).
 echo "Consultando o Azure Firewall '$FIREWALL_NAME'..."
+FIREWALL_ERR=$(mktemp)
 FIREWALL_JSON=$(az network firewall show \
   --resource-group "$RESOURCE_GROUP" \
   --name "$FIREWALL_NAME" \
-  --only-show-errors -o json 2>/dev/null)
+  --only-show-errors -o json 2>"$FIREWALL_ERR")
+FIREWALL_EXIT=$?
+FIREWALL_ERR_TEXT=$(cat "$FIREWALL_ERR")
+rm -f "$FIREWALL_ERR"
 
-if [[ -z "$FIREWALL_JSON" ]]; then
-  echo "Erro: firewall '$FIREWALL_NAME' não encontrado no resource group '$RESOURCE_GROUP'."
+if [[ "$FIREWALL_EXIT" -ne 0 || -z "$FIREWALL_JSON" ]]; then
+  if [[ "$FIREWALL_ERR_TEXT" =~ $AUTH_ERROR_REGEX ]]; then
+    echo "Erro: sua sessão do Azure CLI expirou ou é inválida. Execute 'az login' novamente antes de continuar."
+  elif [[ "$FIREWALL_ERR_TEXT" =~ ResourceGroupNotFound ]]; then
+    echo "Erro: o resource group '$RESOURCE_GROUP' não foi encontrado (ou você não tem permissão para acessá-lo)."
+  elif [[ "$FIREWALL_ERR_TEXT" =~ (ResourceNotFound|was not found) ]]; then
+    echo "Erro: firewall '$FIREWALL_NAME' não encontrado no resource group '$RESOURCE_GROUP'."
+  else
+    echo "Erro: não foi possível consultar o firewall '$FIREWALL_NAME' no resource group '$RESOURCE_GROUP'."
+  fi
+  [[ -n "$FIREWALL_ERR_TEXT" ]] && echo "Detalhe retornado pelo Azure CLI: $FIREWALL_ERR_TEXT"
   exit 1
 fi
 
@@ -298,6 +354,8 @@ done < "$CSV_FILE"
 # transitoriamente (ex.: "AnotherOperationInProgress") quando disparadas em
 # sequência rápida.
 # ---------------------------------------------------------------------------
+# Retorna: 0 = sucesso, 1 = falha comum (esgotou as tentativas), 2 = falha
+# por sessão/token expirado (não adianta tentar de novo, é preciso "az login").
 run_with_retry() {
   local max_attempts=3
   local delay=5
@@ -306,6 +364,10 @@ run_with_retry() {
   while true; do
     if output=$("$@" 2>&1); then
       return 0
+    fi
+    if [[ "$output" =~ $AUTH_ERROR_REGEX ]]; then
+      echo "$output" >&2
+      return 2
     fi
     if [[ "$attempt" -ge "$max_attempts" ]]; then
       echo "$output" >&2
@@ -567,6 +629,13 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
     OK_BY_TYPE[$rule_type]=$(( ${OK_BY_TYPE[$rule_type]:-0} + 1 ))
     EXISTING_RULES["$rule_key"]=1
   else
+    retry_rc=$?
+    if [[ "$retry_rc" -eq 2 ]]; then
+      echo
+      echo "Erro fatal: a sessão do Azure CLI expirou/ficou inválida durante a execução (linha $LINE_NUM, regra '$rule_name')."
+      echo "Execute 'az login' novamente e rode o script mais uma vez: as regras já criadas não serão duplicadas (o script é idempotente)."
+      exit 1
+    fi
     echo "  -> FALHOU (regra '$rule_name' na coleção '$collection_name')"
     FAIL=$((FAIL + 1))
     FAIL_BY_TYPE[$rule_type]=$(( ${FAIL_BY_TYPE[$rule_type]:-0} + 1 ))
