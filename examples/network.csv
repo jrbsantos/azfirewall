@@ -1,0 +1,11 @@
+collection_name,rule_name,priority,action,protocols,source_addresses,destination_addresses,destination_ports
+# Coleção "Net-Coll-DNS": prioridade e action só precisam ser preenchidas na primeira regra da coleção
+Net-Coll-DNS,Allow-DNS,200,Allow,UDP,10.0.2.0/24,168.63.129.16;8.8.8.8;8.8.4.4,53
+Net-Coll-DNS,Allow-DNS-TCP,,,TCP,10.0.2.0/24,168.63.129.16;8.8.8.8;8.8.4.4,53
+# Coleção "Net-Coll-Web": libera saída HTTP/HTTPS para qualquer destino
+Net-Coll-Web,Allow-HTTP,210,Allow,TCP,10.0.2.0/24,*,80
+Net-Coll-Web,Allow-HTTPS,,,TCP,10.0.2.0/24,*,443
+# Coleção "Net-Coll-NTP": UDP para servidores de horário
+Net-Coll-NTP,Allow-NTP,220,Allow,UDP,10.0.2.0/24,132.246.11.231;129.6.15.28,123
+# Coleção "Net-Coll-Block": exemplo de regra de bloqueio (Deny)
+Net-Coll-Block,Deny-Telnet,230,Deny,TCP,10.0.2.0/24,*,23

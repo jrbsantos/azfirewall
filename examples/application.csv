@@ -1,0 +1,10 @@
+collection_name,rule_name,priority,action,protocols,source_addresses,target_fqdns,fqdn_tags
+# Coleção "App-Coll-Web": libera acesso a sites específicos por FQDN
+App-Coll-Web,Allow-Microsoft,400,Allow,Http=80;Https=443,10.0.2.0/24,www.microsoft.com;*.microsoft.com,
+App-Coll-Web,Allow-Ubuntu,,,Https=443,10.0.2.0/24,*.ubuntu.com,
+# Coleção "App-Coll-Windows": usa uma FQDN tag do próprio Azure em vez de listar domínios manualmente
+App-Coll-Windows,Allow-WindowsUpdate,410,Allow,Http=80;Https=443,10.0.2.0/24,,WindowsUpdate
+# Coleção "App-Coll-Sql": exemplo de regra com protocolo Mssql
+App-Coll-Sql,Allow-Sql-Interno,420,Allow,Mssql=1433,10.0.2.0/24,sql.contoso.com,
+# Coleção "App-Coll-Sql-Deny": exemplo de regra de bloqueio (Deny), em coleção própria
+App-Coll-Sql-Deny,Deny-Sql-Externo,430,Deny,Mssql=1433,10.0.2.0/24,*.database.windows.net,

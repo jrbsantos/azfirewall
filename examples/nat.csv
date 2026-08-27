@@ -1,0 +1,6 @@
+collection_name,rule_name,priority,protocols,source_addresses,destination_addresses,destination_ports,translated_address,translated_port
+# Coleção "Nat-Coll-Remoto": redireciona RDP e SSH que chegam no IP público do firewall para VMs internas
+Nat-Coll-Remoto,DNAT-RDP-VM1,300,TCP,203.0.113.0/24,20.36.11.5,3389,10.0.2.4,3389
+Nat-Coll-Remoto,DNAT-SSH-VM2,,TCP,203.0.113.0/24,20.36.11.5,2222,10.0.2.5,22
+# Coleção "Nat-Coll-Web": publica um servidor web interno na porta 8080
+Nat-Coll-Web,DNAT-Web,310,TCP,*,20.36.11.5,80,10.0.2.10,8080
