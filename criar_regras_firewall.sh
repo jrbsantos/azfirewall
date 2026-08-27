@@ -281,7 +281,10 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   # -------------------------------------------------------------------
   rule_key="${collection_name}|${rule_name}"
   if [[ -n "${EXISTING_RULES[$rule_key]:-}" ]]; then
+    detail="action=${action:-Allow} protocolo(s)=${protocols//;/, } origem=${source_addresses//;/, } destino=${destination_addresses//;/, } porta(s)=${destination_ports//;/, }"
+    [[ -n "$priority" ]] && detail+=" priority=$priority"
     echo "[Linha $LINE_NUM] Regra '$rule_name' já existe na coleção '$collection_name' -> ignorada (idempotente)."
+    echo "    Solicitado no CSV: $detail"
     SKIPPED=$((SKIPPED + 1))
     continue
   fi
@@ -342,10 +345,18 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   [[ -n "$source_list" ]] && CMD+=(--source-addresses $source_list)
   [[ -n "$dest_addr_list" ]] && CMD+=(--destination-addresses $dest_addr_list)
 
-  echo "[Linha $LINE_NUM] Criando regra '$rule_name' na coleção '$collection_name'..."
+  proto_display="${protocols_list% }"; proto_display="${proto_display// /, }"
+  src_display="${source_addresses//;/, }"
+  dst_display="${destination_addresses//;/, }"
+  ports_display="${destination_ports//;/, }"
+  detail="action=$action protocolo(s)=$proto_display origem=${src_display:-*} destino=$dst_display porta(s)=$ports_display"
+  [[ -n "$priority" ]] && detail+=" priority=$priority"
+
+  echo "[Linha $LINE_NUM] Criando regra '$rule_name' na coleção '$collection_name': $detail"
 
   if [[ "$DRY_RUN" == true ]]; then
-    printf '  %q ' "${CMD[@]}"
+    printf '    comando:'
+    printf ' %q' "${CMD[@]}"
     echo
     OK=$((OK + 1))
     EXISTING_RULES["$rule_key"]=1
@@ -353,11 +364,11 @@ while IFS=',' read -r collection_name rule_name priority action protocols source
   fi
 
   if run_with_retry "${CMD[@]}" >/dev/null; then
-    echo "  -> OK"
+    echo "  -> OK (regra '$rule_name' criada na coleção '$collection_name')"
     OK=$((OK + 1))
     EXISTING_RULES["$rule_key"]=1
   else
-    echo "  -> FALHOU"
+    echo "  -> FALHOU (regra '$rule_name' na coleção '$collection_name')"
     FAIL=$((FAIL + 1))
   fi
 
